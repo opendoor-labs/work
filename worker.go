@@ -32,7 +32,7 @@ type worker struct {
 	doneDrainingChan chan struct{}
 }
 
-func newWorker(namespace string, poolID string, pool *redis.Pool, contextType reflect.Type, middleware []*middlewareHandler, jobTypes map[string]*jobType, sleepBackoffs []int64) *worker {
+func newWorker(namespace, poolID string, pool *redis.Pool, contextType reflect.Type, middleware []*middlewareHandler, jobTypes map[string]*jobType, sleepBackoffs []int64) *worker {
 	workerID := makeIdentifier()
 	ob := newObserver(namespace, pool, workerID)
 
@@ -146,7 +146,7 @@ func (w *worker) fetchJob() (*Job, error) {
 	// NOTE: we could optimize this to only resort every second, or something.
 	w.sampler.sample()
 	numKeys := len(w.sampler.samples) * fetchKeysPerJobType
-	var scriptArgs = make([]interface{}, 0, numKeys+1)
+	scriptArgs := make([]interface{}, 0, numKeys+1)
 
 	for _, s := range w.sampler.samples {
 		scriptArgs = append(scriptArgs, s.redisJobs, s.redisJobsInProg, s.redisJobsPaused, s.redisJobsLock, s.redisJobsLockInfo, s.redisJobsMaxConcurrency) // KEYS[1-6 * N]
@@ -190,12 +190,23 @@ func (w *worker) fetchJob() (*Job, error) {
 }
 
 func (w *worker) processJob(job *Job) {
+	// Store the original rawJSON for cleanup - this is what's actually in the in-progress queue
+	originalRawJSON := job.rawJSON
+
 	if job.Unique {
 		updatedJob := w.getAndDeleteUniqueJob(job)
+
+		if !reflect.DeepEqual(job.rawJSON, updatedJob.rawJSON) {
+			fmt.Printf("\n\nold: %s\n\nupdated: %s\n", string(job.rawJSON), string(updatedJob.rawJSON))
+			panic("Jobs not equal")
+		}
+
 		// This is to support the old way of doing it, where we used the job off the queue and just deleted the unique key
 		// Going forward the job on the queue will always be just a placeholder, and we will be replacing it with the
 		// updated job extracted here
 		if updatedJob != nil {
+			// Preserve the original rawJSON for cleanup since that's what's in the in-progress queue
+			updatedJob.rawJSON = originalRawJSON
 			job = updatedJob
 		}
 	}
@@ -291,6 +302,7 @@ func terminateAndRetry(w *worker, jt *jobType, job *Job) terminateOp {
 		conn.Send("ZADD", redisKeyRetry(w.namespace), nowEpochSeconds()+jt.calcBackoff(job), rawJSON)
 	}
 }
+
 func terminateAndDead(w *worker, job *Job) terminateOp {
 	rawJSON, err := job.serialize()
 	if err != nil {

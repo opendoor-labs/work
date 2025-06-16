@@ -2,6 +2,7 @@ package work
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -245,6 +246,7 @@ func (e *Enqueuer) uniqueJobHelper(jobName string, args map[string]interface{}, 
 			// we'll use this for updated arguments since the job on the queue
 			// doesn't get updated
 			scriptArgs = append(scriptArgs, rawJSON) // ARGV[2]
+			fmt.Printf("enqueue args: %s", string(rawJSON))
 		}
 
 		if runAt != nil { // Scheduled job so different job queue with additional arg

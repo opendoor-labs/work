@@ -9,12 +9,12 @@ import (
 	"time"
 
 	"github.com/braintree/manners"
-	"github.com/gojek/work"
-	"github.com/gojek/work/webui/internal/assets"
 	"github.com/gomodule/redigo/redis"
+	"github.com/opendoor-labs/work"
+	"github.com/opendoor-labs/work/webui/internal/assets"
 )
 
-// Server implements an HTTP server which exposes a JSON API to view and manage gojek/work items.
+// Server implements an HTTP server which exposes a JSON API to view and manage opendoor-labs/work items.
 type Server struct {
 	server *manners.GracefulServer
 	wg     sync.WaitGroup
