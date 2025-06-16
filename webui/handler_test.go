@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gojek/work"
 	"github.com/gomodule/redigo/redis"
+	"github.com/opendoor-labs/work"
 	"github.com/stretchr/testify/suite"
 )
 

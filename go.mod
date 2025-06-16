@@ -1,4 +1,4 @@
-module github.com/gojek/work
+module github.com/opendoor-labs/work
 
 go 1.22
 
