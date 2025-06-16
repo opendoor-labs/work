@@ -3,7 +3,7 @@ package webui
 import (
 	"net/http"
 
-	"github.com/gojek/work"
+	"github.com/opendoor-labs/work"
 )
 
 // NewHandler return *http.ServeMux for the given work.Client.
