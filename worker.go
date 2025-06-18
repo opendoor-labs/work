@@ -32,7 +32,7 @@ type worker struct {
 	doneDrainingChan chan struct{}
 }
 
-func newWorker(namespace string, poolID string, pool *redis.Pool, contextType reflect.Type, middleware []*middlewareHandler, jobTypes map[string]*jobType, sleepBackoffs []int64) *worker {
+func newWorker(namespace, poolID string, pool *redis.Pool, contextType reflect.Type, middleware []*middlewareHandler, jobTypes map[string]*jobType, sleepBackoffs []int64) *worker {
 	workerID := makeIdentifier()
 	ob := newObserver(namespace, pool, workerID)
 
@@ -122,6 +122,7 @@ func (w *worker) loop() {
 				logError("worker.fetch", err)
 				timer.Reset(10 * time.Millisecond)
 			} else if job != nil {
+				fmt.Printf("Fetched job %s raw message: %s\n", job.Name, job.rawJSON)
 				w.processJob(job)
 				consequtiveNoJobs = 0
 				timer.Reset(0)
@@ -146,7 +147,7 @@ func (w *worker) fetchJob() (*Job, error) {
 	// NOTE: we could optimize this to only resort every second, or something.
 	w.sampler.sample()
 	numKeys := len(w.sampler.samples) * fetchKeysPerJobType
-	var scriptArgs = make([]interface{}, 0, numKeys+1)
+	scriptArgs := make([]interface{}, 0, numKeys+1)
 
 	for _, s := range w.sampler.samples {
 		scriptArgs = append(scriptArgs, s.redisJobs, s.redisJobsInProg, s.redisJobsPaused, s.redisJobsLock, s.redisJobsLockInfo, s.redisJobsMaxConcurrency) // KEYS[1-6 * N]
@@ -191,13 +192,28 @@ func (w *worker) fetchJob() (*Job, error) {
 
 func (w *worker) processJob(job *Job) {
 	if job.Unique {
-		updatedJob := w.getAndDeleteUniqueJob(job)
+		// updatedJob := w.getAndDeleteUniqueJob(job)
 		// This is to support the old way of doing it, where we used the job off the queue and just deleted the unique key
 		// Going forward the job on the queue will always be just a placeholder, and we will be replacing it with the
 		// updated job extracted here
-		if updatedJob != nil {
-			job = updatedJob
+		// if updatedJob != nil {
+		// 	job = updatedJob
+		// }
+		conn := w.pool.Get()
+		defer conn.Close()
+		rawJob, err := redis.Bytes(conn.Do("GETDEL", job.UniqueKey))
+		if err != nil {
+			logError("worker.delete_unique_job.key", err)
 		}
+
+		if rawJob != nil {
+			j, err := newJob(rawJob, job.dequeuedFrom, job.inProgQueue)
+			if err == nil {
+				job = j
+			}
+		}
+
+		
 	}
 	var runErr error
 	jt := w.jobTypes[job.Name]
@@ -267,14 +283,16 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
 func (w *worker) removeJobFromInProgress(job *Job, fate terminateOp) {
 	conn := w.pool.Get()
 	defer conn.Close()
+	fmt.Printf("Removing: %s from in progress queue: %s\n\nRaw JSON content: %s", job.Name, job.inProgQueue, job.rawJSON)
 
 	conn.Send("MULTI")
-	conn.Send("LREM", job.inProgQueue, 1, job.rawJSON)
+	conn.Send("LREM", job.inProgQueue, 0, job.rawJSON)
 	conn.Send("DECR", redisKeyJobsLock(w.namespace, job.Name))
 	conn.Send("HINCRBY", redisKeyJobsLockInfo(w.namespace, job.Name), w.poolID, -1)
 	fate(conn)
 	if _, err := conn.Do("EXEC"); err != nil {
 		logError("worker.remove_job_from_in_progress.lrem", err)
+		fmt.Printf("Could not remove %s from in progress queue", job.Name)
 	}
 }
 
@@ -291,6 +309,7 @@ func terminateAndRetry(w *worker, jt *jobType, job *Job) terminateOp {
 		conn.Send("ZADD", redisKeyRetry(w.namespace), nowEpochSeconds()+jt.calcBackoff(job), rawJSON)
 	}
 }
+
 func terminateAndDead(w *worker, job *Job) terminateOp {
 	rawJSON, err := job.serialize()
 	if err != nil {
