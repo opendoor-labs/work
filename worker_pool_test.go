@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -216,6 +217,115 @@ func TestWorkerPoolPauseSingleThreadedJobs(t *testing.T) {
 	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, wp.workerPoolID, job1)))
 	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, job1)))
 	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, job1), wp.workerPoolID))
+}
+
+func TestWorkerPoolMaxLocalConcurrency(t *testing.T) {
+	pool := newTestPool(t)
+	ns := "work"
+	job1 := "job1"
+	numJobs := 10
+	concurrency := 6
+	sleepTime := 50 // ms per job
+
+	deleteQueue(pool, ns, job1)
+	deleteRetryAndDead(pool, ns)
+	deletePausedAndLockedKeys(ns, job1, pool)
+
+	var current atomic.Int64
+	var peak atomic.Int64
+
+	wp := NewWorkerPool(TestContext{}, uint(concurrency), ns, pool)
+	wp.JobWithOptions(job1, JobOptions{Priority: 1, MaxLocalConcurrency: 2}, func(job *Job) error {
+		c := current.Add(1)
+		for {
+			old := peak.Load()
+			if c <= old || peak.CompareAndSwap(old, c) {
+				break
+			}
+		}
+		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+		current.Add(-1)
+		return nil
+	})
+	sleepBackoffsInMilliseconds = []int64{10, 10, 10, 10, 10}
+	wp.Start()
+
+	enqueuer := NewEnqueuer(ns, pool)
+	for i := 0; i < numJobs; i++ {
+		_, err := enqueuer.Enqueue(job1, Q{"i": i})
+		assert.NoError(t, err)
+	}
+
+	// Wait for all jobs to complete
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining := listSize(pool, redisKeyJobs(ns, job1))
+		inProgress := listSize(pool, redisKeyJobsInProgress(ns, wp.workerPoolID, job1))
+		if remaining == 0 && inProgress == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	wp.Drain()
+	wp.Stop()
+
+	assert.LessOrEqual(t, peak.Load(), int64(2), "peak concurrency should not exceed MaxLocalConcurrency=2")
+	assert.Greater(t, peak.Load(), int64(0), "at least one job should have run")
+}
+
+func TestWorkerPoolNoMaxLocalConcurrency(t *testing.T) {
+	pool := newTestPool(t)
+	ns := "work"
+	job1 := "job1"
+	numJobs := 6
+	concurrency := 6
+	sleepTime := 100 // ms per job
+
+	deleteQueue(pool, ns, job1)
+	deleteRetryAndDead(pool, ns)
+	deletePausedAndLockedKeys(ns, job1, pool)
+
+	var current atomic.Int64
+	var peak atomic.Int64
+
+	wp := NewWorkerPool(TestContext{}, uint(concurrency), ns, pool)
+	wp.JobWithOptions(job1, JobOptions{Priority: 1}, func(job *Job) error {
+		c := current.Add(1)
+		for {
+			old := peak.Load()
+			if c <= old || peak.CompareAndSwap(old, c) {
+				break
+			}
+		}
+		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
+		current.Add(-1)
+		return nil
+	})
+	sleepBackoffsInMilliseconds = []int64{10, 10, 10, 10, 10}
+	wp.Start()
+
+	enqueuer := NewEnqueuer(ns, pool)
+	for i := 0; i < numJobs; i++ {
+		_, err := enqueuer.Enqueue(job1, Q{"i": i})
+		assert.NoError(t, err)
+	}
+
+	// Wait for all jobs to complete
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		remaining := listSize(pool, redisKeyJobs(ns, job1))
+		inProgress := listSize(pool, redisKeyJobsInProgress(ns, wp.workerPoolID, job1))
+		if remaining == 0 && inProgress == 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	wp.Drain()
+	wp.Stop()
+
+	assert.Greater(t, peak.Load(), int64(2), "without MaxLocalConcurrency, peak should exceed 2 with 6 workers")
 }
 
 // Test Helpers

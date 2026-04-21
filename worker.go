@@ -1,6 +1,7 @@
 package work
 
 import (
+	"context"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -205,6 +206,10 @@ func (w *worker) processJob(job *Job) {
 		runErr = fmt.Errorf("stray job: no handler")
 		logError("process_job.stray", runErr)
 	} else {
+		if jt.localSem != nil {
+			jt.localSem.Acquire(context.Background(), 1)
+			defer jt.localSem.Release(1)
+		}
 		w.observeStarted(job.Name, job.ID, job.Args)
 		job.observer = w.observer // for Checkin
 		_, runErr = runJob(job, w.contextType, w.middleware, jt)
