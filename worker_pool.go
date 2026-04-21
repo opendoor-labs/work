@@ -8,6 +8,7 @@ import (
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/robfig/cron/v3"
+	"golang.org/x/sync/semaphore"
 )
 
 // WorkerPool represents a pool of workers. It forms the primary API of opendoor-labs/work. WorkerPools provide the public API of opendoor-labs/work. You can attach jobs and middlware to them. You can start and stop them. Based on their concurrency setting, they'll spin up N worker goroutines.
@@ -39,6 +40,8 @@ type jobType struct {
 	IsGeneric      bool
 	GenericHandler GenericHandler
 	DynamicHandler reflect.Value
+
+	localSem *semaphore.Weighted // per-pool concurrency limiter (nil = unlimited)
 }
 
 func (jt *jobType) calcBackoff(j *Job) int64 {
@@ -56,11 +59,12 @@ type BackoffCalculator func(job *Job) int64
 
 // JobOptions can be passed to JobWithOptions.
 type JobOptions struct {
-	Priority       uint              // Priority from 1 to 10000
-	MaxFails       uint              // 1: send straight to dead (unless SkipDead)
-	SkipDead       bool              // If true, don't send failed jobs to the dead queue when retries are exhausted.
-	MaxConcurrency uint              // Max number of jobs to keep in flight (default is 0, meaning no max)
-	Backoff        BackoffCalculator // If not set, uses the default backoff algorithm
+	Priority            uint              // Priority from 1 to 10000
+	MaxFails            uint              // 1: send straight to dead (unless SkipDead)
+	SkipDead            bool              // If true, don't send failed jobs to the dead queue when retries are exhausted.
+	MaxConcurrency      uint              // Max number of jobs to keep in flight globally across all worker pools (default is 0, meaning no max)
+	MaxLocalConcurrency uint              // Max number of jobs of this type to process concurrently per worker pool (default is 0, meaning no max)
+	Backoff             BackoffCalculator // If not set, uses the default backoff algorithm
 }
 
 // WorkerPoolOptions can be passed to NewWorkerPoolWithOptions.
@@ -160,6 +164,9 @@ func (wp *WorkerPool) JobWithOptions(name string, jobOpts JobOptions, fn interfa
 		Name:           name,
 		DynamicHandler: vfn,
 		JobOptions:     jobOpts,
+	}
+	if jobOpts.MaxLocalConcurrency > 0 {
+		jt.localSem = semaphore.NewWeighted(int64(jobOpts.MaxLocalConcurrency))
 	}
 	if gh, ok := fn.(func(*Job) error); ok {
 		jt.IsGeneric = true
