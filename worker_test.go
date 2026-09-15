@@ -11,6 +11,7 @@ import (
 	"github.com/gomodule/redigo/redis"
 	"github.com/rafaeljusto/redigomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestWorkerBasics(t *testing.T) {
@@ -761,6 +762,49 @@ func TestWorkerUniqueKeyReuseRemovesDequeuedJob(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NoError(t, reaper.cleanStaleLockInfo("other-pool", []string{name}))
 	assert.NoError(t, reaper.cleanStaleLockInfo(w.poolID, []string{name}))
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, name)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
+}
+
+func TestWorkerScheduledUniqueByKeyRemovesDequeuedJob(t *testing.T) {
+	pool := newTestPool(t)
+	ns, name := "work-scheduled", "assessment_photo_ingest"
+	setNowEpochSecondsMock(100000)
+	defer resetNowEpochSecondsMock()
+	enqueuer := NewEnqueuer(ns, pool)
+	scheduled, err := enqueuer.EnqueueUniqueInByKey(name, 30, Q{"trigger": "reconciler"}, Q{"task": "same"})
+	require.NoError(t, err)
+	conn := pool.Get()
+	defer conn.Close()
+	originalUnique, err := redis.Bytes(conn.Do("GET", scheduled.Job.UniqueKey))
+	require.NoError(t, err)
+	setNowEpochSecondsMock(100030)
+	requeuer := newRequeuer(ns, pool, redisKeyScheduled(ns), []string{name})
+	require.True(t, requeuer.process())
+	queued, err := redis.Bytes(conn.Do("LINDEX", redisKeyJobs(ns, name), 0))
+	require.NoError(t, err)
+	uniqueAtStart, err := redis.Bytes(conn.Do("GET", scheduled.Job.UniqueKey))
+	require.NoError(t, err)
+	require.Equal(t, originalUnique, uniqueAtStart)
+	require.NotEqual(t, uniqueAtStart, queued)
+	jobTypes := map[string]*jobType{name: {
+		Name: name, JobOptions: JobOptions{Priority: 1}, IsGeneric: true,
+		GenericHandler: func(job *Job) error { return nil },
+	}}
+	w := newWorker(ns, "pool", pool, tstCtxType, nil, jobTypes, nil)
+	w.start()
+	w.drain()
+	w.stop()
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, w.poolID, name)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
+	assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, name), w.poolID))
+
+	reaper := newDeadPoolReaper(ns, pool, []string{name})
+	require.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}))
+	_, err = conn.Do("HSET", redisKeyJobsLockInfo(ns, name), "other-pool", 0)
+	require.NoError(t, err)
+	require.NoError(t, reaper.cleanStaleLockInfo("other-pool", []string{name}))
+	require.NoError(t, reaper.cleanStaleLockInfo(w.poolID, []string{name}))
 	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, name)))
 	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
 }
