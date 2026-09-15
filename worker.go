@@ -266,6 +266,8 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
 		return nil
 	}
 
+	// Completion must remove the exact payload moved into the in-progress list.
+	jobWithArgs.rawJSON = job.rawJSON
 	return jobWithArgs
 }
 
