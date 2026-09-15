@@ -724,3 +724,43 @@ func TestWorkerPoolStop(t *testing.T) {
 		t.Errorf("Expected that jobs queue was not completely emptied.")
 	}
 }
+
+func TestWorkerUniqueKeyReuseRemovesDequeuedJob(t *testing.T) {
+	pool := newTestPool(t)
+	ns, name := "work", "assessment_photo_ingest"
+	enqueuer := NewEnqueuer(ns, pool)
+	original, err := enqueuer.EnqueueUniqueByKey(name, Q{"trigger": "kafka"}, Q{"task": "same"})
+	if !assert.NoError(t, err) {
+		return
+	}
+	conn := pool.Get()
+	defer conn.Close()
+	_, err = conn.Do("DEL", original.UniqueKey)
+	if !assert.NoError(t, err) {
+		return
+	}
+	_, err = enqueuer.EnqueueUniqueByKey(name, Q{"trigger": "reconciler"}, Q{"task": "same"})
+	if !assert.NoError(t, err) {
+		return
+	}
+	jobTypes := map[string]*jobType{name: {
+		Name: name, JobOptions: JobOptions{Priority: 1}, IsGeneric: true,
+		GenericHandler: func(job *Job) error { return nil },
+	}}
+	w := newWorker(ns, "pool", pool, tstCtxType, nil, jobTypes, nil)
+	w.start()
+	w.drain()
+	w.stop()
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, w.poolID, name)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
+	assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, name), w.poolID))
+
+	reaper := newDeadPoolReaper(ns, pool, []string{name})
+	assert.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}))
+	_, err = conn.Do("HSET", redisKeyJobsLockInfo(ns, name), "other-pool", 0)
+	assert.NoError(t, err)
+	assert.NoError(t, reaper.cleanStaleLockInfo("other-pool", []string{name}))
+	assert.NoError(t, reaper.cleanStaleLockInfo(w.poolID, []string{name}))
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, name)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
+}
