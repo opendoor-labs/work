@@ -50,7 +50,8 @@ func newWorker(namespace string, poolID string, pool *redis.Pool, contextType re
 		contextType:   contextType,
 		sleepBackoffs: sleepBackoffs,
 
-		observer: ob,
+		observer:   ob,
+		inProgress: newInProgressJobs(),
 
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),

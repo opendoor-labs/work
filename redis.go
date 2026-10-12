@@ -202,11 +202,10 @@ var redisLuaCompleteJob = `
 if redis.call('lrem', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
-redis.call('decr', KEYS[2])
-redis.call('hincrby', KEYS[3], ARGV[2], -1)
-if tonumber(redis.call('get', KEYS[2])) < 0 then
+if redis.call('decr', KEYS[2]) < 0 then
   redis.call('set', KEYS[2], 0)
 end
+redis.call('hincrby', KEYS[3], ARGV[2], -1)
 if ARGV[3] ~= '' then
   redis.call('zadd', KEYS[4], ARGV[3], ARGV[4])
 end
@@ -227,11 +226,10 @@ if redis.call('lrem', KEYS[1], 1, ARGV[1]) == 0 then
   return 0
 end
 redis.call('rpush', KEYS[2], ARGV[1])
-redis.call('decr', KEYS[3])
-redis.call('hincrby', KEYS[4], ARGV[2], -1)
-if tonumber(redis.call('get', KEYS[3])) < 0 then
+if redis.call('decr', KEYS[3]) < 0 then
   redis.call('set', KEYS[3], 0)
 end
+redis.call('hincrby', KEYS[4], ARGV[2], -1)
 return 1
 `
 

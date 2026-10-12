@@ -40,18 +40,12 @@ func inProgressEntry(inProgQueue, rawJSON []byte) string {
 }
 
 func (p *inProgressJobs) track(inProgQueue, rawJSON []byte) {
-	if p == nil {
-		return
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.running[inProgressEntry(inProgQueue, rawJSON)] = struct{}{}
 }
 
 func (p *inProgressJobs) finish(job *Job) {
-	if p == nil {
-		return
-	}
 	key := inProgressEntry(job.inProgQueue, job.rawJSON)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -60,9 +54,6 @@ func (p *inProgressJobs) finish(job *Job) {
 }
 
 func (p *inProgressJobs) markUnacked(job *Job, fate terminateOp) {
-	if p == nil {
-		return
-	}
 	key := inProgressEntry(job.inProgQueue, job.rawJSON)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -99,7 +90,6 @@ type inProgressSweeper struct {
 	pool      *redis.Pool
 	jobNames  []string
 	jobs      *inProgressJobs
-	period    time.Duration
 
 	// Payloads that no worker held at the previous sweep. A payload is requeued only when it is
 	// still unheld at the next sweep, so a fetch that is about to call track is not requeued.
@@ -118,7 +108,6 @@ func newInProgressSweeper(namespace, poolID string, pool *redis.Pool, jobNames [
 		pool:             pool,
 		jobNames:         jobNames,
 		jobs:             jobs,
-		period:           inProgressSweepPeriod,
 		suspects:         map[string]struct{}{},
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),
@@ -135,7 +124,7 @@ func (s *inProgressSweeper) stop() {
 }
 
 func (s *inProgressSweeper) loop() {
-	timer := time.NewTimer(s.period)
+	timer := time.NewTimer(inProgressSweepPeriod)
 	defer timer.Stop()
 
 	for {
@@ -144,7 +133,7 @@ func (s *inProgressSweeper) loop() {
 			s.doneStoppingChan <- struct{}{}
 			return
 		case <-timer.C:
-			timer.Reset(s.period + time.Duration(rand.Intn(inProgressSweepJitterSecs))*time.Second)
+			timer.Reset(inProgressSweepPeriod + time.Duration(rand.Intn(inProgressSweepJitterSecs))*time.Second)
 			if err := s.sweep(); err != nil {
 				logError("in_progress_sweeper.sweep", err)
 			}
@@ -168,20 +157,11 @@ func (s *inProgressSweeper) ackUnacked() error {
 	return nil
 }
 
-func (s *inProgressSweeper) requeueOrphans() (err error) {
+func (s *inProgressSweeper) requeueOrphans() error {
 	conn := s.pool.Get()
 	defer conn.Close()
 
 	nextSuspects := map[string]struct{}{}
-	defer func() {
-		if err != nil {
-			for key := range s.suspects {
-				nextSuspects[key] = struct{}{}
-			}
-		}
-		s.suspects = nextSuspects
-	}()
-
 	for _, jobName := range s.jobNames {
 		inProgQueue := redisKeyJobsInProgress(s.namespace, s.poolID, jobName)
 		payloads, err := redis.ByteSlices(conn.Do("LRANGE", inProgQueue, 0, -1))
@@ -210,5 +190,6 @@ func (s *inProgressSweeper) requeueOrphans() (err error) {
 			}
 		}
 	}
+	s.suspects = nextSuspects
 	return nil
 }

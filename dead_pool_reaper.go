@@ -85,10 +85,6 @@ func (r *deadPoolReaper) reap() error {
 	// Cleanup all dead pools. Each step must succeed before the next one removes the record that
 	// lets a later reap retry it.
 	for deadPoolID, jobTypes := range deadPoolIDs {
-		if len(jobTypes) == 0 {
-			// the heartbeat is gone, so use the current set of jobs
-			jobTypes = r.curJobTypes
-		}
 		if err = r.requeueInProgressJobs(deadPoolID, jobTypes); err != nil {
 			return err
 		}
@@ -185,13 +181,13 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 	return deadPools, nil
 }
 
-// checkPool reports whether a pool is dead, and the job types from its last heartbeat. The job
-// types are empty when the heartbeat is gone.
+// checkPool reports whether a pool is dead, and the job types from its last heartbeat. When the
+// heartbeat is gone, it returns the reaper's current job types.
 func (r *deadPoolReaper) checkPool(conn redis.Conn, workerPoolID string) (bool, []string, error) {
 	heartbeatKey := redisKeyHeartbeat(r.namespace, workerPoolID)
 	heartbeatAt, err := redis.Int64(conn.Do("HGET", heartbeatKey, "heartbeat_at"))
 	if err == redis.ErrNil {
-		return true, []string{}, nil
+		return true, r.curJobTypes, nil
 	}
 	if err != nil {
 		return false, nil, err
@@ -221,7 +217,6 @@ func (r *deadPoolReaper) findUnregisteredLockHolders(conn redis.Conn, workerPool
 		registered[workerPoolID] = struct{}{}
 	}
 
-	seen := map[string]struct{}{}
 	var unregistered []string
 	for _, jobType := range r.curJobTypes {
 		poolIDs, err := redis.Strings(conn.Do("HKEYS", redisKeyJobsLockInfo(r.namespace, jobType)))
@@ -229,10 +224,8 @@ func (r *deadPoolReaper) findUnregisteredLockHolders(conn redis.Conn, workerPool
 			return nil, err
 		}
 		for _, poolID := range poolIDs {
-			_, isRegistered := registered[poolID]
-			_, isSeen := seen[poolID]
-			if !isRegistered && !isSeen {
-				seen[poolID] = struct{}{}
+			if _, ok := registered[poolID]; !ok {
+				registered[poolID] = struct{}{}
 				unregistered = append(unregistered, poolID)
 			}
 		}
