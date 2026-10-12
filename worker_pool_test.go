@@ -346,3 +346,54 @@ func setupTestWorkerPool(pool *redis.Pool, namespace, jobName string, concurrenc
 	sleepBackoffsInMilliseconds = []int64{10, 10, 10, 10, 10}
 	return wp
 }
+
+func TestWorkerPoolStopKeepsRegistrationWhenCleanupFails(t *testing.T) {
+	pool := newTestPool(t)
+	ns, job1 := "work", "job1"
+	wp := setupTestWorkerPool(pool, ns, job1, 1, JobOptions{Priority: 1})
+	_, err := NewEnqueuer(ns, pool).Enqueue(job1, Q{"sleep": 0})
+	assert.NoError(t, err)
+	wp.Start()
+	wp.Drain()
+
+	conn := pool.Get()
+	defer conn.Close()
+	_, err = conn.Do("SET", redisKeyJobsLock(ns, job1), "not-a-number")
+	assert.NoError(t, err)
+	wp.Stop()
+
+	isMember, err := redis.Bool(conn.Do("SISMEMBER", redisKeyWorkerPools(ns), wp.workerPoolID))
+	assert.NoError(t, err)
+	assert.True(t, isMember)
+	exists, err := redis.Bool(conn.Do("EXISTS", redisKeyHeartbeat(ns, wp.workerPoolID)))
+	assert.NoError(t, err)
+	assert.True(t, exists)
+
+	_, err = conn.Do("SET", redisKeyJobsLock(ns, job1), 0)
+	assert.NoError(t, err)
+	reaper := newDeadPoolReaper(ns, pool, []string{job1})
+	reaper.deadTime = -time.Minute
+	assert.NoError(t, reaper.reap())
+	isMember, err = redis.Bool(conn.Do("SISMEMBER", redisKeyWorkerPools(ns), wp.workerPoolID))
+	assert.NoError(t, err)
+	assert.False(t, isMember)
+	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, job1), wp.workerPoolID))
+}
+
+func TestWorkerPoolStopDeregistersAfterCleanup(t *testing.T) {
+	pool := newTestPool(t)
+	ns, job1 := "work", "job1"
+	wp := setupTestWorkerPool(pool, ns, job1, 1, JobOptions{Priority: 1})
+	wp.Start()
+	wp.Drain()
+	wp.Stop()
+
+	conn := pool.Get()
+	defer conn.Close()
+	isMember, err := redis.Bool(conn.Do("SISMEMBER", redisKeyWorkerPools(ns), wp.workerPoolID))
+	assert.NoError(t, err)
+	assert.False(t, isMember)
+	exists, err := redis.Bool(conn.Do("EXISTS", redisKeyHeartbeat(ns, wp.workerPoolID)))
+	assert.NoError(t, err)
+	assert.False(t, exists)
+}

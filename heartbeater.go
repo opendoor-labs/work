@@ -25,7 +25,7 @@ type workerPoolHeartbeater struct {
 	hostname     string
 	workerIDs    string
 
-	stopChan         chan struct{}
+	stopChan         chan bool
 	doneStoppingChan chan struct{}
 }
 
@@ -36,7 +36,7 @@ func newWorkerPoolHeartbeater(namespace string, pool *redis.Pool, workerPoolID s
 		pool:             pool,
 		beatPeriod:       beatPeriod,
 		concurrency:      concurrency,
-		stopChan:         make(chan struct{}),
+		stopChan:         make(chan bool),
 		doneStoppingChan: make(chan struct{}),
 	}
 
@@ -62,22 +62,26 @@ func newWorkerPoolHeartbeater(namespace string, pool *redis.Pool, workerPoolID s
 }
 
 func (h *workerPoolHeartbeater) start() {
+	h.startedAt = nowEpochSeconds()
+	h.heartbeat()
 	go h.loop()
 }
 
-func (h *workerPoolHeartbeater) stop() {
-	h.stopChan <- struct{}{}
+// stop ends the heartbeat. When deregister is false, the pool stays in the worker pools set with
+// its last heartbeat, so the dead pool reaper cleans it up later.
+func (h *workerPoolHeartbeater) stop(deregister bool) {
+	h.stopChan <- deregister
 	<-h.doneStoppingChan
 }
 
 func (h *workerPoolHeartbeater) loop() {
-	h.startedAt = nowEpochSeconds()
-	h.heartbeat() // do it right away
 	ticker := time.Tick(h.beatPeriod)
 	for {
 		select {
-		case <-h.stopChan:
-			h.removeHeartbeat()
+		case deregister := <-h.stopChan:
+			if deregister {
+				h.removeHeartbeat()
+			}
 			h.doneStoppingChan <- struct{}{}
 			return
 		case <-ticker:
@@ -94,7 +98,7 @@ func (h *workerPoolHeartbeater) heartbeat() {
 	heartbeatKey := redisKeyHeartbeat(h.namespace, h.workerPoolID)
 
 	conn.Send("SADD", workerPoolsKey, h.workerPoolID)
-	conn.Send("HMSET", heartbeatKey,
+	_, err := conn.Do("HMSET", heartbeatKey,
 		"heartbeat_at", nowEpochSeconds(),
 		"started_at", h.startedAt,
 		"job_names", h.jobNames,
@@ -103,8 +107,7 @@ func (h *workerPoolHeartbeater) heartbeat() {
 		"host", h.hostname,
 		"pid", h.pid,
 	)
-
-	if err := conn.Flush(); err != nil {
+	if err != nil {
 		logError("heartbeat", err)
 	}
 }

@@ -38,7 +38,7 @@ func TestHeartbeater(t *testing.T) {
 	assert.True(t, h["pid"] != "")
 	assert.True(t, h["host"] != "")
 
-	heart.stop()
+	heart.stop(true)
 
 	assert.False(t, redisInSet(pool, redisKeyWorkerPools(ns), "abcd"))
 }
