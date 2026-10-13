@@ -25,6 +25,7 @@ type worker struct {
 	redisFetchScript *redis.Script
 	sampler          prioritySampler
 	inProgress       *inProgressJobs
+	registered       func() bool
 	*observer
 
 	stopChan         chan struct{}
@@ -52,6 +53,7 @@ func newWorker(namespace string, poolID string, pool *redis.Pool, contextType re
 
 		observer:   ob,
 		inProgress: newInProgressJobs(),
+		registered: func() bool { return true },
 
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),
@@ -120,7 +122,11 @@ func (w *worker) loop() {
 			drained = true
 			timer.Reset(0)
 		case <-timer.C:
-			job, err := w.fetchJob()
+			var job *Job
+			var err error
+			if w.registered() {
+				job, err = w.fetchJob()
+			}
 			if err != nil {
 				logError("worker.fetch", err)
 				timer.Reset(10 * time.Millisecond)

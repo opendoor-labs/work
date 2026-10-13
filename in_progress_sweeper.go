@@ -145,16 +145,18 @@ func (s *inProgressSweeper) sweep() error {
 	return errors.Join(s.ackUnacked(), s.requeueOrphans())
 }
 
-// ackUnacked retries the completion of finished jobs. It returns the first error and keeps the
-// remaining jobs for the next sweep.
+// ackUnacked retries the completion of every finished job and keeps the ones that fail for the
+// next attempt.
 func (s *inProgressSweeper) ackUnacked() error {
+	var errs []error
 	for _, u := range s.jobs.unackedJobs() {
 		if err := completeInProgressJob(s.pool, s.namespace, s.poolID, u.job, u.fate); err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
 		s.jobs.finish(u.job)
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *inProgressSweeper) requeueOrphans() error {

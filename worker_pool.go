@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/robfig/cron/v3"
@@ -219,12 +220,11 @@ func (wp *WorkerPool) Start() {
 	wp.writeConcurrencyControlsToRedis()
 	go wp.writeKnownJobsToRedis()
 
-	// The reaper treats a pool that holds locks without a heartbeat as dead, so the first
-	// heartbeat must land before any worker fetches a job.
 	wp.heartbeater = newWorkerPoolHeartbeater(wp.namespace, wp.pool, wp.workerPoolID, wp.jobTypes, wp.concurrency, wp.workerIDs())
 	wp.heartbeater.start()
 
 	for _, w := range wp.workers {
+		w.registered = wp.heartbeater.registered.Load
 		go w.start()
 	}
 
@@ -254,10 +254,7 @@ func (wp *WorkerPool) Stop() {
 	wg.Wait()
 	jobTypes := wp.jobNames()
 
-	// Record finished jobs first, so the requeue below does not run them again.
-	if err := wp.inProgressSweeper.ackUnacked(); err != nil {
-		logError("in_progress_sweeper.ack_unacked", err)
-	}
+	wp.ackUnackedBeforeRequeue()
 
 	cleanedUp := true
 	if err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes); err != nil {
@@ -288,6 +285,21 @@ func (wp *WorkerPool) Drain() {
 		}(w)
 	}
 	wg.Wait()
+}
+
+// Only this process knows which in-progress payloads already ran. A payload whose completion
+// Redis still rejects after these retries is requeued below and runs again.
+var stopAckBackoffs = []time.Duration{0, 100 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
+
+func (wp *WorkerPool) ackUnackedBeforeRequeue() {
+	var err error
+	for _, backoff := range stopAckBackoffs {
+		time.Sleep(backoff)
+		if err = wp.inProgressSweeper.ackUnacked(); err == nil {
+			return
+		}
+	}
+	logError("in_progress_sweeper.ack_unacked", err)
 }
 
 func (wp *WorkerPool) jobNames() []string {

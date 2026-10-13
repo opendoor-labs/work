@@ -4,6 +4,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gomodule/redigo/redis"
@@ -24,6 +25,10 @@ type workerPoolHeartbeater struct {
 	pid          int
 	hostname     string
 	workerIDs    string
+
+	// registered is set once a heartbeat has landed. Workers do not fetch before then, because the
+	// reaper treats a pool that holds locks without a heartbeat as dead.
+	registered atomic.Bool
 
 	stopChan         chan bool
 	doneStoppingChan chan struct{}
@@ -109,7 +114,9 @@ func (h *workerPoolHeartbeater) heartbeat() {
 	)
 	if err != nil {
 		logError("heartbeat", err)
+		return
 	}
+	h.registered.Store(true)
 }
 
 func (h *workerPoolHeartbeater) removeHeartbeat() {

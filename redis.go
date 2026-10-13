@@ -214,6 +214,8 @@ return 1
 
 // Used by the in-progress sweeper to return a job that no worker in the pool holds.
 // This happens when the fetch script ran but its reply did not reach the worker.
+// The job goes back to the right end, where fetches pop from: it was the oldest job when it was
+// fetched, and every job added since then was pushed to the left.
 //
 // KEYS[1] = the pool's in-progress list for the job
 // KEYS[2] = the job queue

@@ -397,3 +397,51 @@ func TestWorkerPoolStopDeregistersAfterCleanup(t *testing.T) {
 	assert.NoError(t, err)
 	assert.False(t, exists)
 }
+
+func TestWorkerPoolDoesNotFetchBeforeFirstHeartbeat(t *testing.T) {
+	pool := newTestPool(t)
+	ns, job1 := "work", "job1"
+	wp := setupTestWorkerPool(pool, ns, job1, 1, JobOptions{Priority: 1})
+	_, err := NewEnqueuer(ns, pool).Enqueue(job1, Q{"sleep": 0})
+	assert.NoError(t, err)
+	conn := pool.Get()
+	defer conn.Close()
+	_, err = conn.Do("SET", redisKeyWorkerPools(ns), "not-a-set")
+	assert.NoError(t, err)
+
+	wp.Start()
+	defer wp.Stop()
+	time.Sleep(100 * time.Millisecond)
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobs(ns, job1)))
+
+	_, err = conn.Do("DEL", redisKeyWorkerPools(ns))
+	assert.NoError(t, err)
+	wp.heartbeater.heartbeat()
+	wp.Drain()
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, job1)))
+}
+
+func TestWorkerPoolStopRetriesUnackedCompletion(t *testing.T) {
+	pool, server := newTestPoolWithServer(t)
+	ns, job1 := "work", "job1"
+	wp := setupTestWorkerPool(pool, ns, job1, 1, JobOptions{Priority: 1})
+	defer func(backoffs []time.Duration) { stopAckBackoffs = backoffs }(stopAckBackoffs)
+	stopAckBackoffs = []time.Duration{0, 100 * time.Millisecond, 100 * time.Millisecond}
+	wp.Start()
+
+	rawJSON := `{"name":"job1","id":"finished"}`
+	seedInProgressJob(t, pool, ns, wp.workerPoolID, job1, rawJSON)
+	inProgQueue := redisKeyJobsInProgress(ns, wp.workerPoolID, job1)
+	wp.inProgress.markUnacked(&Job{Name: job1, rawJSON: []byte(rawJSON), inProgQueue: []byte(inProgQueue)}, terminateOnly)
+
+	server.SetError("OOM command not allowed when used memory > 'maxmemory'.")
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		server.SetError("")
+	}()
+	wp.Stop()
+
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, job1)))
+	assert.EqualValues(t, 0, listSize(pool, inProgQueue))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, job1)))
+}

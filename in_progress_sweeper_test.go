@@ -23,7 +23,12 @@ func seedInProgressJob(t *testing.T, pool *redis.Pool, ns, poolID, jobName, rawJ
 func TestInProgressSweeperRequeuesUnheldJobOnSecondSweep(t *testing.T) {
 	pool := newTestPool(t)
 	ns, poolID, jobName := "work", "pool1", "persist"
-	seedInProgressJob(t, pool, ns, poolID, jobName, `{"name":"persist","id":"orphan"}`)
+	orphan := `{"name":"persist","id":"orphan"}`
+	seedInProgressJob(t, pool, ns, poolID, jobName, orphan)
+	conn := pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("LPUSH", redisKeyJobs(ns, jobName), `{"name":"persist","id":"newer"}`)
+	require.NoError(t, err)
 	sweeper := newInProgressSweeper(ns, poolID, pool, []string{jobName}, newInProgressJobs())
 
 	require.NoError(t, sweeper.sweep())
@@ -32,9 +37,39 @@ func TestInProgressSweeperRequeuesUnheldJobOnSecondSweep(t *testing.T) {
 
 	require.NoError(t, sweeper.sweep())
 	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, poolID, jobName)))
-	assert.EqualValues(t, 1, listSize(pool, redisKeyJobs(ns, jobName)))
+	assert.EqualValues(t, 2, listSize(pool, redisKeyJobs(ns, jobName)))
 	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, jobName)))
 	assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, jobName), poolID))
+	next, err := redis.String(conn.Do("RPOP", redisKeyJobs(ns, jobName)))
+	require.NoError(t, err)
+	assert.Equal(t, orphan, next, "the orphan is older than every queued job, so it is fetched next")
+}
+
+func TestInProgressSweeperAcksEveryCompletionItCan(t *testing.T) {
+	pool := newTestPool(t)
+	ns, poolID := "work", "pool1"
+	newJobRef := func(name, rawJSON string) *Job {
+		seedInProgressJob(t, pool, ns, poolID, name, rawJSON)
+		return &Job{Name: name, rawJSON: []byte(rawJSON), inProgQueue: []byte(redisKeyJobsInProgress(ns, poolID, name))}
+	}
+	broken := newJobRef("broken", `{"name":"broken","id":"a"}`)
+	healthy := newJobRef("healthy", `{"name":"healthy","id":"b"}`)
+	conn := pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("SET", string(broken.inProgQueue), "not-a-list")
+	require.NoError(t, err)
+	jobs := newInProgressJobs()
+	jobs.markUnacked(broken, terminateOnly)
+	jobs.markUnacked(healthy, terminateOnly)
+	sweeper := newInProgressSweeper(ns, poolID, pool, []string{"healthy"}, jobs)
+
+	assert.Error(t, sweeper.ackUnacked())
+
+	unacked := jobs.unackedJobs()
+	require.Len(t, unacked, 1)
+	assert.Equal(t, "broken", unacked[0].job.Name)
+	assert.EqualValues(t, 0, listSize(pool, string(healthy.inProgQueue)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, "healthy")))
 }
 
 func TestInProgressSweeperLeavesHeldJobs(t *testing.T) {
