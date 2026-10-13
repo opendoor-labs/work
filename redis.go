@@ -186,6 +186,55 @@ for i=1,keylen,%d do
 end
 return nil`, requeueKeysPerJob)
 
+// Used by workers to finish a job, and by the in-progress sweeper to retry a finish that failed.
+// The lock is released only when the payload is still in progress, so a retry after a lost reply
+// cannot release the same slot twice.
+//
+// KEYS[1] = the pool's in-progress list for the job
+// KEYS[2] = the job's lock
+// KEYS[3] = the job's lock info hash
+// KEYS[4] = the retry or dead zset that receives a failed job
+// ARGV[1] = the payload in the in-progress list
+// ARGV[2] = the worker pool id
+// ARGV[3] = the zset score, or "" when the job leaves no record
+// ARGV[4] = the payload to add to the zset
+var redisLuaCompleteJob = `
+if redis.call('lrem', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+if redis.call('decr', KEYS[2]) < 0 then
+  redis.call('set', KEYS[2], 0)
+end
+redis.call('hincrby', KEYS[3], ARGV[2], -1)
+if ARGV[3] ~= '' then
+  redis.call('zadd', KEYS[4], ARGV[3], ARGV[4])
+end
+return 1
+`
+
+// Used by the in-progress sweeper to return a job that no worker in the pool holds.
+// This happens when the fetch script ran but its reply did not reach the worker.
+// The job goes back to the right end, where fetches pop from: it was the oldest job when it was
+// fetched, and every job added since then was pushed to the left.
+//
+// KEYS[1] = the pool's in-progress list for the job
+// KEYS[2] = the job queue
+// KEYS[3] = the job's lock
+// KEYS[4] = the job's lock info hash
+// ARGV[1] = the payload in the in-progress list
+// ARGV[2] = the worker pool id
+var redisLuaRequeueOrphanedJob = `
+if redis.call('lrem', KEYS[1], 1, ARGV[1]) == 0 then
+  return 0
+end
+redis.call('rpush', KEYS[2], ARGV[1])
+if redis.call('decr', KEYS[3]) < 0 then
+  redis.call('set', KEYS[3], 0)
+end
+redis.call('hincrby', KEYS[4], ARGV[2], -1)
+return 1
+`
+
 // Used by the reaper to clean up stale locks
 //
 // KEYS[1] = the 1st job's lock
@@ -207,7 +256,10 @@ for i=1,keylen,2 do
   deadLockCount = tonumber(redis.call('hget', lockInfo, deadPoolID))
 
   if deadLockCount then
-    redis.call('decrby', lock, deadLockCount)
+    -- A negative count is left from a double release or a hand edit. DECRBY with it raises the lock.
+    if deadLockCount > 0 then
+      redis.call('decrby', lock, deadLockCount)
+    end
     redis.call('hdel', lockInfo, deadPoolID)
 
     if tonumber(redis.call('get', lock)) < 0 then

@@ -23,6 +23,11 @@ type deadPoolReaper struct {
 	reapPeriod  time.Duration
 	curJobTypes []string
 
+	// Pools whose heartbeat was missing at the previous reap. A missing heartbeat counts as dead
+	// only when it is still missing at the next reap: under an eviction policy Redis can drop the
+	// heartbeat of a live pool, and the live pool writes it again within one beat period.
+	missingHeartbeats map[string]struct{}
+
 	stopChan         chan struct{}
 	doneStoppingChan chan struct{}
 }
@@ -82,21 +87,16 @@ func (r *deadPoolReaper) reap() error {
 
 	workerPoolsKey := redisKeyWorkerPools(r.namespace)
 
-	// Cleanup all dead pools
+	// Cleanup all dead pools. Each step must succeed before the next one removes the record that
+	// lets a later reap retry it.
 	for deadPoolID, jobTypes := range deadPoolIDs {
-		lockJobTypes := jobTypes
-		// if we found jobs from the heartbeat, requeue them and remove the heartbeat
-		if len(jobTypes) > 0 {
-			r.requeueInProgressJobs(deadPoolID, jobTypes)
-			if _, err = conn.Do("DEL", redisKeyHeartbeat(r.namespace, deadPoolID)); err != nil {
-				return err
-			}
-		} else {
-			// try to clean up locks for the current set of jobs if heartbeat was not found
-			lockJobTypes = r.curJobTypes
+		if err = r.requeueInProgressJobs(deadPoolID, jobTypes); err != nil {
+			return err
 		}
-		// Cleanup any stale lock info
-		if err = r.cleanStaleLockInfo(deadPoolID, lockJobTypes); err != nil {
+		if err = r.cleanStaleLockInfo(deadPoolID, jobTypes); err != nil {
+			return err
+		}
+		if _, err = conn.Do("DEL", redisKeyHeartbeat(r.namespace, deadPoolID)); err != nil {
 			return err
 		}
 
@@ -167,35 +167,77 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	deadPools := map[string][]string{}
-	for _, workerPoolID := range workerPoolIDs {
-		heartbeatKey := redisKeyHeartbeat(r.namespace, workerPoolID)
-		heartbeatAt, err := redis.Int64(conn.Do("HGET", heartbeatKey, "heartbeat_at"))
-		if err == redis.ErrNil {
-			// heartbeat expired, save dead pool and use cur set of jobs from reaper
-			deadPools[workerPoolID] = []string{}
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		// Check that last heartbeat was long enough ago to consider the pool dead
-		if time.Unix(heartbeatAt, 0).Add(r.deadTime).After(time.Now()) {
-			continue
-		}
-
-		jobTypesList, err := redis.String(conn.Do("HGET", heartbeatKey, "job_names"))
-		if err == redis.ErrNil {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		deadPools[workerPoolID] = strings.Split(jobTypesList, ",")
+	unregistered, err := r.findUnregisteredLockHolders(conn, workerPoolIDs)
+	if err != nil {
+		return nil, err
 	}
 
+	deadPools := map[string][]string{}
+	missingHeartbeats := map[string]struct{}{}
+	for _, workerPoolID := range append(workerPoolIDs, unregistered...) {
+		dead, jobTypes, err := r.checkPool(conn, workerPoolID, missingHeartbeats)
+		if err != nil {
+			return nil, err
+		}
+		if dead {
+			deadPools[workerPoolID] = jobTypes
+		}
+	}
+	r.missingHeartbeats = missingHeartbeats
+
 	return deadPools, nil
+}
+
+// checkPool reports whether a pool is dead, and the job types from its last heartbeat. When the
+// heartbeat is gone, it returns the reaper's current job types.
+func (r *deadPoolReaper) checkPool(conn redis.Conn, workerPoolID string, missingHeartbeats map[string]struct{}) (bool, []string, error) {
+	heartbeatKey := redisKeyHeartbeat(r.namespace, workerPoolID)
+	heartbeatAt, err := redis.Int64(conn.Do("HGET", heartbeatKey, "heartbeat_at"))
+	if err == redis.ErrNil {
+		missingHeartbeats[workerPoolID] = struct{}{}
+		_, missingBefore := r.missingHeartbeats[workerPoolID]
+		return missingBefore, r.curJobTypes, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+
+	// Check that last heartbeat was long enough ago to consider the pool dead
+	if time.Unix(heartbeatAt, 0).Add(r.deadTime).After(time.Now()) {
+		return false, nil, nil
+	}
+
+	jobTypesList, err := redis.String(conn.Do("HGET", heartbeatKey, "job_names"))
+	if err == redis.ErrNil {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	return true, strings.Split(jobTypesList, ","), nil
+}
+
+// findUnregisteredLockHolders returns pools that have lock info for a current job type but are not
+// in the worker pools set. Such a pool left the set without releasing its locks, so a check of the
+// set alone never finds it.
+func (r *deadPoolReaper) findUnregisteredLockHolders(conn redis.Conn, workerPoolIDs []string) ([]string, error) {
+	registered := make(map[string]struct{}, len(workerPoolIDs))
+	for _, workerPoolID := range workerPoolIDs {
+		registered[workerPoolID] = struct{}{}
+	}
+
+	var unregistered []string
+	for _, jobType := range r.curJobTypes {
+		poolIDs, err := redis.Strings(conn.Do("HKEYS", redisKeyJobsLockInfo(r.namespace, jobType)))
+		if err != nil {
+			return nil, err
+		}
+		for _, poolID := range poolIDs {
+			if _, ok := registered[poolID]; !ok {
+				registered[poolID] = struct{}{}
+				unregistered = append(unregistered, poolID)
+			}
+		}
+	}
+	return unregistered, nil
 }

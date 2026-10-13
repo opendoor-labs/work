@@ -473,6 +473,12 @@ func BenchmarkJobProcessing(b *testing.B) {
 
 func newTestPool(t testing.TB) *redis.Pool {
 	t.Helper()
+	pool, _ := newTestPoolWithServer(t)
+	return pool
+}
+
+func newTestPoolWithServer(t testing.TB) (*redis.Pool, *miniredis.Miniredis) {
+	t.Helper()
 
 	s, err := miniredis.Run()
 	assert.NoError(t, err)
@@ -486,7 +492,7 @@ func newTestPool(t testing.TB) *redis.Pool {
 			return redis.Dial("tcp", s.Addr())
 		},
 		Wait: true,
-	}
+	}, s
 }
 
 func newMockTestPool(t testing.TB) (*redis.Pool, *redigomock.Conn) {

@@ -134,7 +134,10 @@ func TestDeadPoolReaperNoHeartbeat(t *testing.T) {
 	reaper := newDeadPoolReaper(ns, pool, []string{"type1"})
 	deadPools, err := reaper.findDeadPools()
 	assert.NoError(t, err)
-	assert.Equal(t, map[string][]string{"1": {}, "2": {}, "3": {}}, deadPools)
+	assert.Empty(t, deadPools, "a missing heartbeat counts as dead only at the second check")
+	deadPools, err = reaper.findDeadPools()
+	assert.NoError(t, err)
+	assert.Equal(t, map[string][]string{"1": {"type1"}, "2": {"type1"}, "3": {"type1"}}, deadPools)
 
 	// Test requeueing jobs
 	_, err = conn.Do("lpush", redisKeyJobsInProgress(ns, "2", "type1"), "foo")
@@ -159,15 +162,14 @@ func TestDeadPoolReaperNoHeartbeat(t *testing.T) {
 	err = reaper.reap()
 	assert.NoError(t, err)
 
-	// Ensure jobs queue was not altered
+	// The in-progress job was requeued using reap.curJobTypes
 	jobsCount, err = redis.Int(conn.Do("llen", redisKeyJobs(ns, "type1")))
 	assert.NoError(t, err)
-	assert.Equal(t, 0, jobsCount)
+	assert.Equal(t, 1, jobsCount)
 
-	// Ensure inprogress queue was not altered
 	jobsCount, err = redis.Int(conn.Do("llen", redisKeyJobsInProgress(ns, "2", "type1")))
 	assert.NoError(t, err)
-	assert.Equal(t, 1, jobsCount)
+	assert.Equal(t, 0, jobsCount)
 
 	// Ensure dead worker pools were removed from the set
 	jobsCount, err = redis.Int(conn.Do("scard", redisKeyWorkerPools(ns)))
@@ -298,7 +300,7 @@ func TestDeadPoolReaperWithWorkerPools(t *testing.T) {
 	// now we should have 1 job in queue and no more stale jobs
 	assert.EqualValues(t, 1, listSize(pool, redisKeyJobs(ns, job1)))
 	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, wp.workerPoolID, job1)))
-	staleHeart.stop()
+	staleHeart.stop(true)
 	wp.deadPoolReaper.stop()
 }
 
@@ -352,4 +354,124 @@ func TestDeadPoolReaperCleanStaleLocks(t *testing.T) {
 	assert.Nil(t, v)
 	v, err = conn.Do("HGET", lockInfo2, workerPoolID2)
 	assert.Nil(t, v)
+}
+
+func TestDeadPoolReaperReapsUnregisteredLockHolders(t *testing.T) {
+	pool := newTestPool(t)
+	ns, jobName := "work", "type1"
+	conn := pool.Get()
+	defer conn.Close()
+
+	live := newWorkerPoolHeartbeater(ns, pool, "live", map[string]*jobType{jobName: nil}, 1, []string{"w1"})
+	live.start()
+	defer live.stop(true)
+	seedInProgressJob(t, pool, ns, "live", jobName, `{"id":"live"}`)
+	seedInProgressJob(t, pool, ns, "gone", jobName, `{"id":"gone1"}`)
+	seedInProgressJob(t, pool, ns, "gone", jobName, `{"id":"gone2"}`)
+	_, err := conn.Do("HSET", redisKeyJobsLockInfo(ns, jobName), "empty", 0)
+	assert.NoError(t, err)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{jobName})
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 2, listSize(pool, redisKeyJobsInProgress(ns, "gone", jobName)))
+	assert.NoError(t, reaper.reap())
+
+	assert.EqualValues(t, 2, listSize(pool, redisKeyJobs(ns, jobName)))
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobsInProgress(ns, "gone", jobName)))
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobsInProgress(ns, "live", jobName)))
+	assert.EqualValues(t, 1, getInt64(pool, redisKeyJobsLock(ns, jobName)))
+	assert.EqualValues(t, 1, hgetInt64(pool, redisKeyJobsLockInfo(ns, jobName), "live"))
+	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, jobName), "gone"))
+	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, jobName), "empty"))
+	isMember, err := redis.Bool(conn.Do("SISMEMBER", redisKeyWorkerPools(ns), "live"))
+	assert.NoError(t, err)
+	assert.True(t, isMember)
+}
+
+func TestDeadPoolReaperLeavesUnregisteredPoolWithFreshHeartbeat(t *testing.T) {
+	pool := newTestPool(t)
+	ns, jobName, poolID := "work", "type1", "registering"
+	conn := pool.Get()
+	defer conn.Close()
+
+	_, err := conn.Do("HMSET", redisKeyHeartbeat(ns, poolID), "heartbeat_at", nowEpochSeconds(), "job_names", jobName)
+	assert.NoError(t, err)
+	seedInProgressJob(t, pool, ns, poolID, jobName, `{"id":"running"}`)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{jobName})
+	assert.NoError(t, reaper.reap())
+
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobsInProgress(ns, poolID, jobName)))
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, jobName)))
+	assert.EqualValues(t, 1, getInt64(pool, redisKeyJobsLock(ns, jobName)))
+	assert.EqualValues(t, 1, hgetInt64(pool, redisKeyJobsLockInfo(ns, jobName), poolID))
+}
+
+func TestDeadPoolReaperKeepsDeadPoolWhenRequeueFails(t *testing.T) {
+	pool := newTestPool(t)
+	ns, jobName, deadPoolID := "work", "type1", "dead"
+	conn := pool.Get()
+	defer conn.Close()
+
+	_, err := conn.Do("SADD", redisKeyWorkerPools(ns), deadPoolID)
+	assert.NoError(t, err)
+	_, err = conn.Do("HMSET", redisKeyHeartbeat(ns, deadPoolID), "heartbeat_at", 1, "job_names", jobName)
+	assert.NoError(t, err)
+	seedInProgressJob(t, pool, ns, deadPoolID, jobName, `{"id":"stuck"}`)
+	_, err = conn.Do("SET", redisKeyJobs(ns, jobName), "not-a-list")
+	assert.NoError(t, err)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{jobName})
+	assert.Error(t, reaper.reap())
+
+	isMember, err := redis.Bool(conn.Do("SISMEMBER", redisKeyWorkerPools(ns), deadPoolID))
+	assert.NoError(t, err)
+	assert.True(t, isMember)
+	jobNames, err := redis.String(conn.Do("HGET", redisKeyHeartbeat(ns, deadPoolID), "job_names"))
+	assert.NoError(t, err)
+	assert.Equal(t, jobName, jobNames)
+
+	_, err = conn.Do("DEL", redisKeyJobs(ns, jobName))
+	assert.NoError(t, err)
+	assert.NoError(t, reaper.reap())
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobs(ns, jobName)))
+	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, jobName)))
+	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, jobName), deadPoolID))
+}
+
+func TestDeadPoolReaperKeepsPoolWhoseHeartbeatReturns(t *testing.T) {
+	pool := newTestPool(t)
+	ns, jobName, poolID := "work", "type1", "evicted"
+	conn := pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("SADD", redisKeyWorkerPools(ns), poolID)
+	assert.NoError(t, err)
+	seedInProgressJob(t, pool, ns, poolID, jobName, `{"id":"running"}`)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{jobName})
+	assert.NoError(t, reaper.reap())
+	_, err = conn.Do("HMSET", redisKeyHeartbeat(ns, poolID), "heartbeat_at", nowEpochSeconds(), "job_names", jobName)
+	assert.NoError(t, err)
+	assert.NoError(t, reaper.reap())
+
+	assert.EqualValues(t, 1, listSize(pool, redisKeyJobsInProgress(ns, poolID, jobName)))
+	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, jobName)))
+	assert.EqualValues(t, 1, getInt64(pool, redisKeyJobsLock(ns, jobName)))
+}
+
+func TestDeadPoolReaperIgnoresNegativeLockInfo(t *testing.T) {
+	pool := newTestPool(t)
+	ns, jobName := "work", "type1"
+	conn := pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("SET", redisKeyJobsLock(ns, jobName), 3)
+	assert.NoError(t, err)
+	_, err = conn.Do("HSET", redisKeyJobsLockInfo(ns, jobName), "stale", -2)
+	assert.NoError(t, err)
+
+	reaper := newDeadPoolReaper(ns, pool, []string{jobName})
+	assert.NoError(t, reaper.cleanStaleLockInfo("stale", []string{jobName}))
+
+	assert.EqualValues(t, 3, getInt64(pool, redisKeyJobsLock(ns, jobName)))
+	assert.False(t, hexists(pool, redisKeyJobsLockInfo(ns, jobName), "stale"))
 }

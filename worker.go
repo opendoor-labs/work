@@ -24,6 +24,8 @@ type worker struct {
 
 	redisFetchScript *redis.Script
 	sampler          prioritySampler
+	inProgress       *inProgressJobs
+	registered       func() bool
 	*observer
 
 	stopChan         chan struct{}
@@ -49,7 +51,9 @@ func newWorker(namespace string, poolID string, pool *redis.Pool, contextType re
 		contextType:   contextType,
 		sleepBackoffs: sleepBackoffs,
 
-		observer: ob,
+		observer:   ob,
+		inProgress: newInProgressJobs(),
+		registered: func() bool { return true },
 
 		stopChan:         make(chan struct{}),
 		doneStoppingChan: make(chan struct{}),
@@ -118,7 +122,11 @@ func (w *worker) loop() {
 			drained = true
 			timer.Reset(0)
 		case <-timer.C:
-			job, err := w.fetchJob()
+			var job *Job
+			var err error
+			if w.registered() {
+				job, err = w.fetchJob()
+			}
 			if err != nil {
 				logError("worker.fetch", err)
 				timer.Reset(10 * time.Millisecond)
@@ -181,6 +189,8 @@ func (w *worker) fetchJob() (*Job, error) {
 	if !ok {
 		return nil, fmt.Errorf("response in prog not bytes")
 	}
+
+	w.inProgress.track(inProgQueue, rawJSON)
 
 	job, err := newJob(rawJSON, dequeuedFrom, inProgQueue)
 	if err != nil {
@@ -272,31 +282,57 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
 }
 
 func (w *worker) removeJobFromInProgress(job *Job, fate terminateOp) {
-	conn := w.pool.Get()
-	defer conn.Close()
-
-	conn.Send("MULTI")
-	conn.Send("LREM", job.inProgQueue, 1, job.rawJSON)
-	conn.Send("DECR", redisKeyJobsLock(w.namespace, job.Name))
-	conn.Send("HINCRBY", redisKeyJobsLockInfo(w.namespace, job.Name), w.poolID, -1)
-	fate(conn)
-	if _, err := conn.Do("EXEC"); err != nil {
-		logError("worker.remove_job_from_in_progress.lrem", err)
+	if err := completeInProgressJob(w.pool, w.namespace, w.poolID, job, fate); err != nil {
+		logError("worker.remove_job_from_in_progress", err)
+		w.inProgress.markUnacked(job, fate)
+		return
 	}
+	w.inProgress.finish(job)
 }
 
-type terminateOp func(conn redis.Conn)
+var completeJobScript = redis.NewScript(4, redisLuaCompleteJob)
 
-func terminateOnly(_ redis.Conn) { return }
+func completeInProgressJob(pool *redis.Pool, namespace, poolID string, job *Job, fate terminateOp) error {
+	conn := pool.Get()
+	defer conn.Close()
+
+	zsetKey := fate.zsetKey
+	if zsetKey == "" {
+		zsetKey = redisKeyDead(namespace)
+	}
+	score := ""
+	if fate.zsetKey != "" {
+		score = fmt.Sprint(fate.score)
+	}
+	_, err := completeJobScript.Do(conn,
+		job.inProgQueue,
+		redisKeyJobsLock(namespace, job.Name),
+		redisKeyJobsLockInfo(namespace, job.Name),
+		zsetKey,
+		job.rawJSON,
+		poolID,
+		score,
+		fate.rawJSON,
+	)
+	return err
+}
+
+// terminateOp says where a finished job goes. A zero value means the job leaves no record.
+type terminateOp struct {
+	zsetKey string
+	score   int64
+	rawJSON []byte
+}
+
+var terminateOnly = terminateOp{}
+
 func terminateAndRetry(w *worker, jt *jobType, job *Job) terminateOp {
 	rawJSON, err := job.serialize()
 	if err != nil {
 		logError("worker.terminate_and_retry.serialize", err)
 		return terminateOnly
 	}
-	return func(conn redis.Conn) {
-		conn.Send("ZADD", redisKeyRetry(w.namespace), nowEpochSeconds()+jt.calcBackoff(job), rawJSON)
-	}
+	return terminateOp{zsetKey: redisKeyRetry(w.namespace), score: nowEpochSeconds() + jt.calcBackoff(job), rawJSON: rawJSON}
 }
 func terminateAndDead(w *worker, job *Job) terminateOp {
 	rawJSON, err := job.serialize()
@@ -304,14 +340,9 @@ func terminateAndDead(w *worker, job *Job) terminateOp {
 		logError("worker.terminate_and_dead.serialize", err)
 		return terminateOnly
 	}
-	return func(conn redis.Conn) {
-		// NOTE: sidekiq limits the # of jobs: only keep jobs for 6 months, and only keep a max # of jobs
-		// The max # of jobs seems really horrible. Seems like operations should be on top of it.
-		// conn.Send("ZREMRANGEBYSCORE", redisKeyDead(w.namespace), "-inf", now - keepInterval)
-		// conn.Send("ZREMRANGEBYRANK", redisKeyDead(w.namespace), 0, -maxJobs)
-
-		conn.Send("ZADD", redisKeyDead(w.namespace), nowEpochSeconds(), rawJSON)
-	}
+	// NOTE: sidekiq limits the # of jobs: only keep jobs for 6 months, and only keep a max # of jobs
+	// The max # of jobs seems really horrible. Seems like operations should be on top of it.
+	return terminateOp{zsetKey: redisKeyDead(w.namespace), score: nowEpochSeconds(), rawJSON: rawJSON}
 }
 
 func (w *worker) jobFate(jt *jobType, job *Job) terminateOp {

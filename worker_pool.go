@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gomodule/redigo/redis"
 	"github.com/robfig/cron/v3"
@@ -25,12 +26,14 @@ type WorkerPool struct {
 	started      bool
 	periodicJobs []*periodicJob
 
-	workers          []*worker
-	heartbeater      *workerPoolHeartbeater
-	retrier          *requeuer
-	scheduler        *requeuer
-	deadPoolReaper   *deadPoolReaper
-	periodicEnqueuer *periodicEnqueuer
+	workers           []*worker
+	inProgress        *inProgressJobs
+	inProgressSweeper *inProgressSweeper
+	heartbeater       *workerPoolHeartbeater
+	retrier           *requeuer
+	scheduler         *requeuer
+	deadPoolReaper    *deadPoolReaper
+	periodicEnqueuer  *periodicEnqueuer
 }
 
 type jobType struct {
@@ -110,10 +113,12 @@ func NewWorkerPoolWithOptions(ctx interface{}, concurrency uint, namespace strin
 		sleepBackoffs: workerPoolOpts.SleepBackoffs,
 		contextType:   ctxType,
 		jobTypes:      make(map[string]*jobType),
+		inProgress:    newInProgressJobs(),
 	}
 
 	for i := uint(0); i < wp.concurrency; i++ {
 		w := newWorker(wp.namespace, wp.workerPoolID, wp.pool, wp.contextType, nil, wp.jobTypes, wp.sleepBackoffs)
+		w.inProgress = wp.inProgress
 		wp.workers = append(wp.workers, w)
 	}
 
@@ -215,12 +220,16 @@ func (wp *WorkerPool) Start() {
 	wp.writeConcurrencyControlsToRedis()
 	go wp.writeKnownJobsToRedis()
 
+	wp.heartbeater = newWorkerPoolHeartbeater(wp.namespace, wp.pool, wp.workerPoolID, wp.jobTypes, wp.concurrency, wp.workerIDs())
+	wp.heartbeater.start()
+
 	for _, w := range wp.workers {
+		w.registered = wp.heartbeater.registered.Load
 		go w.start()
 	}
 
-	wp.heartbeater = newWorkerPoolHeartbeater(wp.namespace, wp.pool, wp.workerPoolID, wp.jobTypes, wp.concurrency, wp.workerIDs())
-	wp.heartbeater.start()
+	wp.inProgressSweeper = newInProgressSweeper(wp.namespace, wp.workerPoolID, wp.pool, wp.jobNames(), wp.inProgress)
+	wp.inProgressSweeper.start()
 	wp.startRequeuers()
 	wp.periodicEnqueuer = newPeriodicEnqueuer(wp.namespace, wp.pool, wp.periodicJobs)
 	wp.periodicEnqueuer.start()
@@ -233,6 +242,7 @@ func (wp *WorkerPool) Stop() {
 	}
 	wp.started = false
 
+	wp.inProgressSweeper.stop()
 	wg := sync.WaitGroup{}
 	for _, w := range wp.workers {
 		wg.Add(1)
@@ -242,21 +252,24 @@ func (wp *WorkerPool) Stop() {
 		}(w)
 	}
 	wg.Wait()
-	jobTypes := make([]string, 0, len(wp.jobTypes))
-	for k := range wp.jobTypes {
-		jobTypes = append(jobTypes, k)
-	}
+	jobTypes := wp.jobNames()
 
-	err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes)
-	if err != nil {
+	wp.ackUnackedBeforeRequeue()
+
+	cleanedUp := true
+	if err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes); err != nil {
 		logError("dead_pool_reaper.requeue_in_progress_jobs", err)
+		cleanedUp = false
+	} else {
+		wp.inProgress.reset()
 	}
-
-	err = wp.deadPoolReaper.cleanStaleLockInfo(wp.workerPoolID, jobTypes)
-	if err != nil {
+	if err := wp.deadPoolReaper.cleanStaleLockInfo(wp.workerPoolID, jobTypes); err != nil {
 		logError("dead_pool_reaper.clean_stale_lock_info", err)
+		cleanedUp = false
 	}
-	wp.heartbeater.stop()
+	// When cleanup fails, the pool stays registered so that the reaper in another process
+	// finds it after the heartbeat expires and releases its locks.
+	wp.heartbeater.stop(cleanedUp)
 	wp.retrier.stop()
 	wp.scheduler.stop()
 	wp.deadPoolReaper.stop()
@@ -276,11 +289,31 @@ func (wp *WorkerPool) Drain() {
 	wg.Wait()
 }
 
-func (wp *WorkerPool) startRequeuers() {
+// Only this process knows which in-progress payloads already ran. A payload whose completion
+// Redis still rejects after these retries is requeued below and runs again.
+var stopAckBackoffs = []time.Duration{0, 100 * time.Millisecond, 500 * time.Millisecond, time.Second, 2 * time.Second}
+
+func (wp *WorkerPool) ackUnackedBeforeRequeue() {
+	var err error
+	for _, backoff := range stopAckBackoffs {
+		time.Sleep(backoff)
+		if err = wp.inProgressSweeper.ackUnacked(); err == nil {
+			return
+		}
+	}
+	logError("in_progress_sweeper.ack_unacked", err)
+}
+
+func (wp *WorkerPool) jobNames() []string {
 	jobNames := make([]string, 0, len(wp.jobTypes))
 	for k := range wp.jobTypes {
 		jobNames = append(jobNames, k)
 	}
+	return jobNames
+}
+
+func (wp *WorkerPool) startRequeuers() {
+	jobNames := wp.jobNames()
 	wp.retrier = newRequeuer(wp.namespace, wp.pool, redisKeyRetry(wp.namespace), jobNames)
 	wp.scheduler = newRequeuer(wp.namespace, wp.pool, redisKeyScheduled(wp.namespace), jobNames)
 	wp.deadPoolReaper = newDeadPoolReaper(wp.namespace, wp.pool, jobNames)
