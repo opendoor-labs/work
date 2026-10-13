@@ -23,6 +23,11 @@ type deadPoolReaper struct {
 	reapPeriod  time.Duration
 	curJobTypes []string
 
+	// Pools whose heartbeat was missing at the previous reap. A missing heartbeat counts as dead
+	// only when it is still missing at the next reap: under an eviction policy Redis can drop the
+	// heartbeat of a live pool, and the live pool writes it again within one beat period.
+	missingHeartbeats map[string]struct{}
+
 	stopChan         chan struct{}
 	doneStoppingChan chan struct{}
 }
@@ -168,8 +173,9 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 	}
 
 	deadPools := map[string][]string{}
+	missingHeartbeats := map[string]struct{}{}
 	for _, workerPoolID := range append(workerPoolIDs, unregistered...) {
-		dead, jobTypes, err := r.checkPool(conn, workerPoolID)
+		dead, jobTypes, err := r.checkPool(conn, workerPoolID, missingHeartbeats)
 		if err != nil {
 			return nil, err
 		}
@@ -177,17 +183,20 @@ func (r *deadPoolReaper) findDeadPools() (map[string][]string, error) {
 			deadPools[workerPoolID] = jobTypes
 		}
 	}
+	r.missingHeartbeats = missingHeartbeats
 
 	return deadPools, nil
 }
 
 // checkPool reports whether a pool is dead, and the job types from its last heartbeat. When the
 // heartbeat is gone, it returns the reaper's current job types.
-func (r *deadPoolReaper) checkPool(conn redis.Conn, workerPoolID string) (bool, []string, error) {
+func (r *deadPoolReaper) checkPool(conn redis.Conn, workerPoolID string, missingHeartbeats map[string]struct{}) (bool, []string, error) {
 	heartbeatKey := redisKeyHeartbeat(r.namespace, workerPoolID)
 	heartbeatAt, err := redis.Int64(conn.Do("HGET", heartbeatKey, "heartbeat_at"))
 	if err == redis.ErrNil {
-		return true, r.curJobTypes, nil
+		missingHeartbeats[workerPoolID] = struct{}{}
+		_, missingBefore := r.missingHeartbeats[workerPoolID]
+		return missingBefore, r.curJobTypes, nil
 	}
 	if err != nil {
 		return false, nil, err

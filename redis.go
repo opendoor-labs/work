@@ -256,7 +256,10 @@ for i=1,keylen,2 do
   deadLockCount = tonumber(redis.call('hget', lockInfo, deadPoolID))
 
   if deadLockCount then
-    redis.call('decrby', lock, deadLockCount)
+    -- A negative count is left from a double release or a hand edit. DECRBY with it raises the lock.
+    if deadLockCount > 0 then
+      redis.call('decrby', lock, deadLockCount)
+    end
     redis.call('hdel', lockInfo, deadPoolID)
 
     if tonumber(redis.call('get', lock)) < 0 then

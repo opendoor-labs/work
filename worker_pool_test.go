@@ -445,3 +445,23 @@ func TestWorkerPoolStopRetriesUnackedCompletion(t *testing.T) {
 	assert.EqualValues(t, 0, listSize(pool, inProgQueue))
 	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, job1)))
 }
+
+func TestWorkerPoolStopForgetsRequeuedPayloads(t *testing.T) {
+	pool := newTestPool(t)
+	ns, job1 := "work", "job1"
+	wp := setupTestWorkerPool(pool, ns, job1, 1, JobOptions{Priority: 1})
+	defer func(backoffs []time.Duration) { stopAckBackoffs = backoffs }(stopAckBackoffs)
+	stopAckBackoffs = []time.Duration{0}
+	wp.Start()
+
+	inProgQueue := redisKeyJobsInProgress(ns, wp.workerPoolID, "other")
+	conn := pool.Get()
+	defer conn.Close()
+	_, err := conn.Do("SET", inProgQueue, "not-a-list")
+	assert.NoError(t, err)
+	wp.inProgress.markUnacked(&Job{Name: "other", rawJSON: []byte(`{"id":"a"}`), inProgQueue: []byte(inProgQueue)}, terminateOnly)
+
+	wp.Stop()
+
+	assert.Empty(t, wp.inProgress.unackedJobs())
+}

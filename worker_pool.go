@@ -260,6 +260,8 @@ func (wp *WorkerPool) Stop() {
 	if err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes); err != nil {
 		logError("dead_pool_reaper.requeue_in_progress_jobs", err)
 		cleanedUp = false
+	} else {
+		wp.inProgress.reset()
 	}
 	if err := wp.deadPoolReaper.cleanStaleLockInfo(wp.workerPoolID, jobTypes); err != nil {
 		logError("dead_pool_reaper.clean_stale_lock_info", err)

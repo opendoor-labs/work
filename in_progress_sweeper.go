@@ -61,6 +61,14 @@ func (p *inProgressJobs) markUnacked(job *Job, fate terminateOp) {
 	p.unacked[key] = unackedJob{job: job, fate: fate}
 }
 
+// reset forgets every payload, after Stop has returned them all to the job queues.
+func (p *inProgressJobs) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.running = map[string]struct{}{}
+	p.unacked = map[string]unackedJob{}
+}
+
 func (p *inProgressJobs) holds(key string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
