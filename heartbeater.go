@@ -127,9 +127,7 @@ func (h *workerPoolHeartbeater) removeHeartbeat() {
 	heartbeatKey := redisKeyHeartbeat(h.namespace, h.workerPoolID)
 
 	conn.Send("SREM", workerPoolsKey, h.workerPoolID)
-	conn.Send("DEL", heartbeatKey)
-
-	if err := conn.Flush(); err != nil {
+	if _, err := conn.Do("DEL", heartbeatKey); err != nil {
 		logError("remove_heartbeat", err)
 	}
 }
