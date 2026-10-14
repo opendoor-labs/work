@@ -156,14 +156,15 @@ return nil`, fetchKeysPerJobType)
 // Used by the reaper to re-enqueue jobs that were in progress, one job per call.
 //
 // A job whose last enqueue or failure is older than ARGV[2] goes to the dead set instead, scored
-// ARGV[3]. Such a job sat in a pool that died long ago; running it now acts on stale data.
-// ARGV[2] = 0 requeues every job.
+// ARGV[3], or is dropped when its job type skips the dead set. Such a job sat in a pool that died
+// long ago; running it now acts on stale data. ARGV[2] = 0 requeues every job.
 //
 // KEYS[4i+1..4i+4] = the i-th job type's in progress queue, job queue, lock and lock info hash
 // KEYS[last] = the dead zset
 // ARGV[1] = the worker pool id
 // ARGV[2] = the unix time before which a job is abandoned, or 0
 // ARGV[3] = the current unix time
+// ARGV[4+i] = "1" when the i-th job type skips the dead set, otherwise "0"
 var redisLuaReenqueueJob = fmt.Sprintf(`
 local function releaseLock(lockKey, lockInfoKey, workerPoolID)
   redis.call('decr', lockKey)
@@ -202,12 +203,16 @@ for i=1,keylen-1,%d do
     if abandonBefore > 0 then
       seen = lastSeen(res)
       if seen > 0 and seen < abandonBefore then
-        dest = deadKey
+        if ARGV[4 + math.floor((i - 1) / %d)] == '1' then
+          dest = ''
+        else
+          dest = deadKey
+        end
       end
     end
     if dest == deadKey then
       redis.call('zadd', deadKey, now, res)
-    else
+    elseif dest == jobQueue then
       redis.call('lpush', jobQueue, res)
     end
     redis.call('rpop', inProgQueue)
@@ -215,7 +220,7 @@ for i=1,keylen-1,%d do
     return {res, inProgQueue, dest}
   end
 end
-return nil`, requeueKeysPerJob)
+return nil`, requeueKeysPerJob, requeueKeysPerJob)
 
 // Used by workers to finish a job, and by the in-progress sweeper to retry a finish that failed.
 // The lock is released only when the payload is still in progress, so a retry after a lost reply

@@ -317,6 +317,12 @@ func (wp *WorkerPool) startRequeuers() {
 	wp.retrier = newRequeuer(wp.namespace, wp.pool, redisKeyRetry(wp.namespace), jobNames)
 	wp.scheduler = newRequeuer(wp.namespace, wp.pool, redisKeyScheduled(wp.namespace), jobNames)
 	wp.deadPoolReaper = newDeadPoolReaper(wp.namespace, wp.pool, jobNames)
+	wp.deadPoolReaper.skipDeadJobTypes = map[string]struct{}{}
+	for name, jt := range wp.jobTypes {
+		if jt.SkipDead {
+			wp.deadPoolReaper.skipDeadJobTypes[name] = struct{}{}
+		}
+	}
 	wp.retrier.start()
 	wp.scheduler.start()
 	wp.deadPoolReaper.start()

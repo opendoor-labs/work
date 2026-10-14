@@ -16,7 +16,8 @@ const (
 	requeueKeysPerJob = 4
 
 	// A job left in a dead pool's in-progress list longer than this goes to the dead set instead of
-	// back to its queue. It must exceed the longest gap between a job's retries.
+	// back to its queue. The retry and scheduled requeuers reset a job's enqueue time, so this only
+	// has to exceed how long a job can wait in its queue before a worker takes it.
 	abandonedJobAge = 30 * 24 * time.Hour
 )
 
@@ -26,6 +27,9 @@ type deadPoolReaper struct {
 	deadTime    time.Duration
 	reapPeriod  time.Duration
 	curJobTypes []string
+
+	// Job types registered with SkipDead. Their stale orphans are dropped, not added to the dead set.
+	skipDeadJobTypes map[string]struct{}
 
 	// Pools whose heartbeat was missing at the previous reap. A missing heartbeat counts as dead
 	// only when it is still missing at the next reap: under an eviction policy Redis can drop the
@@ -134,11 +138,12 @@ func (r *deadPoolReaper) cleanStaleLockInfo(poolID string, jobTypes []string) er
 }
 
 // requeueInProgressJobs moves a pool's in-progress jobs back to their queues. Jobs last enqueued or
-// failed before abandonBefore go to the dead set instead; a zero abandonBefore requeues them all.
+// failed before abandonBefore go to the dead set instead, or are dropped when their type skips the
+// dead set; a zero abandonBefore requeues them all.
 func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobTypes []string, abandonBefore time.Time) error {
 	numKeys := len(jobTypes)*requeueKeysPerJob + 1
 	redisRequeueScript := redis.NewScript(numKeys, redisLuaReenqueueJob)
-	var scriptArgs = make([]interface{}, 0, numKeys+3)
+	var scriptArgs = make([]interface{}, 0, numKeys+3+len(jobTypes))
 
 	for _, jobType := range jobTypes {
 		// pops from in progress, push into job queue and decrement the queue lock
@@ -152,14 +157,21 @@ func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobTypes []string,
 		abandonBeforeUnix = abandonBefore.Unix()
 	}
 	scriptArgs = append(scriptArgs, poolID, abandonBeforeUnix, time.Now().Unix()) // ARGV[1-3]
+	for _, jobType := range jobTypes {
+		skipDead := "0"
+		if _, ok := r.skipDeadJobTypes[jobType]; ok {
+			skipDead = "1"
+		}
+		scriptArgs = append(scriptArgs, skipDead) // ARGV[4 + i]
+	}
 
 	conn := r.pool.Get()
 	defer conn.Close()
 
-	abandoned := 0
+	movedToDead, dropped := 0, 0
 	defer func() {
-		if abandoned > 0 {
-			logError("dead_pool_reaper.abandon_stale_jobs", fmt.Errorf("moved %d jobs of pool %s idle since before %s to the dead set", abandoned, poolID, abandonBefore.UTC().Format(time.RFC3339)))
+		if movedToDead+dropped > 0 {
+			logError("dead_pool_reaper.abandon_stale_jobs", fmt.Errorf("pool %s had jobs idle since before %s: moved %d to the dead set, dropped %d that skip it", poolID, abandonBefore.UTC().Format(time.RFC3339), movedToDead, dropped))
 		}
 	}()
 
@@ -175,8 +187,11 @@ func (r *deadPoolReaper) requeueInProgressJobs(poolID string, jobTypes []string,
 		if len(values) != 3 {
 			return fmt.Errorf("need 3 elements back")
 		}
-		if dest, _ := redis.String(values[2], nil); dest == deadKey {
-			abandoned++
+		switch dest, _ := redis.String(values[2], nil); dest {
+		case deadKey:
+			movedToDead++
+		case "":
+			dropped++
 		}
 	}
 }
