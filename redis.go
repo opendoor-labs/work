@@ -153,38 +153,74 @@ for i=1,keylen,%d do
 end
 return nil`, fetchKeysPerJobType)
 
-// Used by the reaper to re-enqueue jobs that were in progress
+// Used by the reaper to re-enqueue jobs that were in progress, one job per call.
 //
-// KEYS[1] = the 1st job's in progress queue
-// KEYS[2] = the 1st job's job queue
-// KEYS[3] = the 2nd job's in progress queue
-// KEYS[4] = the 2nd job's job queue
-// ...
-// KEYS[N] = the last job's in progress queue
-// KEYS[N+1] = the last job's job queue
-// ARGV[1] = workerPoolID for job queue
+// A job whose last enqueue or failure is older than ARGV[2] goes to the dead set instead, scored
+// ARGV[3], or is dropped when its job type skips the dead set. Such a job sat in a pool that died
+// long ago; running it now acts on stale data. ARGV[2] = 0 requeues every job.
+//
+// KEYS[4i+1..4i+4] = the i-th job type's in progress queue, job queue, lock and lock info hash
+// KEYS[last] = the dead zset
+// ARGV[1] = the worker pool id
+// ARGV[2] = the unix time before which a job is abandoned, or 0
+// ARGV[3] = the current unix time
+// ARGV[4+i] = "1" when the i-th job type skips the dead set, otherwise "0"
 var redisLuaReenqueueJob = fmt.Sprintf(`
 local function releaseLock(lockKey, lockInfoKey, workerPoolID)
   redis.call('decr', lockKey)
   redis.call('hincrby', lockInfoKey, workerPoolID, -1)
 end
 
-local keylen = #KEYS
-local res, jobQueue, inProgQueue, workerPoolID, lockKey, lockInfoKey
-workerPoolID = ARGV[1]
+local function lastSeen(job)
+  local ok, decoded = pcall(cjson.decode, job)
+  if not ok or type(decoded) ~= 'table' then
+    return 0
+  end
+  local seen = tonumber(decoded['t']) or 0
+  local failedAt = tonumber(decoded['failed_at']) or 0
+  if failedAt > seen then
+    seen = failedAt
+  end
+  return seen
+end
 
-for i=1,keylen,%d do
+local keylen = #KEYS
+local deadKey = KEYS[keylen]
+local res, jobQueue, inProgQueue, workerPoolID, lockKey, lockInfoKey, seen, dest
+workerPoolID = ARGV[1]
+local abandonBefore = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+for i=1,keylen-1,%d do
   inProgQueue = KEYS[i]
   jobQueue = KEYS[i+1]
   lockKey = KEYS[i+2]
   lockInfoKey = KEYS[i+3]
-  res = redis.call('rpoplpush', inProgQueue, jobQueue)
+  -- Write the job to its destination before removing it: a failed write must leave it in progress.
+  res = redis.call('lindex', inProgQueue, -1)
   if res then
+    dest = jobQueue
+    if abandonBefore > 0 then
+      seen = lastSeen(res)
+      if seen > 0 and seen < abandonBefore then
+        if ARGV[4 + math.floor((i - 1) / %d)] == '1' then
+          dest = ''
+        else
+          dest = deadKey
+        end
+      end
+    end
+    if dest == deadKey then
+      redis.call('zadd', deadKey, now, res)
+    elseif dest == jobQueue then
+      redis.call('lpush', jobQueue, res)
+    end
+    redis.call('rpop', inProgQueue)
     releaseLock(lockKey, lockInfoKey, workerPoolID)
-    return {res, inProgQueue, jobQueue}
+    return {res, inProgQueue, dest}
   end
 end
-return nil`, requeueKeysPerJob)
+return nil`, requeueKeysPerJob, requeueKeysPerJob)
 
 // Used by workers to finish a job, and by the in-progress sweeper to retry a finish that failed.
 // The lock is released only when the payload is still in progress, so a retry after a lost reply
