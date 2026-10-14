@@ -257,7 +257,7 @@ func (wp *WorkerPool) Stop() {
 	wp.ackUnackedBeforeRequeue()
 
 	cleanedUp := true
-	if err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes); err != nil {
+	if err := wp.deadPoolReaper.requeueInProgressJobs(wp.workerPoolID, jobTypes, time.Time{}); err != nil {
 		logError("dead_pool_reaper.requeue_in_progress_jobs", err)
 		cleanedUp = false
 	} else {

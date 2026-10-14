@@ -763,7 +763,7 @@ func TestWorkerUniqueKeyReuseRemovesDequeuedJob(t *testing.T) {
 	assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, name), w.poolID))
 
 	reaper := newDeadPoolReaper(ns, pool, []string{name})
-	assert.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}))
+	assert.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}, time.Time{}))
 	_, err = conn.Do("HSET", redisKeyJobsLockInfo(ns, name), "other-pool", 0)
 	assert.NoError(t, err)
 	assert.NoError(t, reaper.cleanStaleLockInfo("other-pool", []string{name}))
@@ -806,7 +806,7 @@ func TestWorkerScheduledUniqueByKeyRemovesDequeuedJob(t *testing.T) {
 	assert.EqualValues(t, 0, hgetInt64(pool, redisKeyJobsLockInfo(ns, name), w.poolID))
 
 	reaper := newDeadPoolReaper(ns, pool, []string{name})
-	require.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}))
+	require.NoError(t, reaper.requeueInProgressJobs(w.poolID, []string{name}, time.Time{}))
 	_, err = conn.Do("HSET", redisKeyJobsLockInfo(ns, name), "other-pool", 0)
 	require.NoError(t, err)
 	require.NoError(t, reaper.cleanStaleLockInfo("other-pool", []string{name}))
