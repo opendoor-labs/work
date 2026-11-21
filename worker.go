@@ -201,21 +201,19 @@ func (w *worker) fetchJob() (*Job, error) {
 }
 
 func (w *worker) processJob(job *Job) {
+	var runErr error
 	if job.Unique {
-		updatedJob := w.getAndDeleteUniqueJob(job)
-		// This is to support the old way of doing it, where we used the job off the queue and just deleted the unique key
-		// Going forward the job on the queue will always be just a placeholder, and we will be replacing it with the
-		// updated job extracted here
+		updatedJob, err := w.getAndDeleteUniqueJob(job)
+		runErr = err
 		if updatedJob != nil {
 			job = updatedJob
 		}
 	}
-	var runErr error
 	jt := w.jobTypes[job.Name]
 	if jt == nil {
 		runErr = fmt.Errorf("stray job: no handler")
 		logError("process_job.stray", runErr)
-	} else {
+	} else if runErr == nil {
 		if jt.localSem != nil {
 			jt.localSem.Acquire(context.Background(), 1)
 			defer jt.localSem.Release(1)
@@ -234,17 +232,17 @@ func (w *worker) processJob(job *Job) {
 	w.removeJobFromInProgress(job, fate)
 }
 
-func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
+func (w *worker) getAndDeleteUniqueJob(job *Job) (*Job, error) {
 	var uniqueKey string
 	var err error
 
 	if job.UniqueKey != "" {
 		uniqueKey = job.UniqueKey
-	} else { // For jobs put in queue prior to this change. In the future this can be deleted as there will always be a UniqueKey
+	} else {
 		uniqueKey, err = redisKeyUniqueJob(w.namespace, job.Name, job.Args)
 		if err != nil {
 			logError("worker.delete_unique_job.key", err)
-			return nil
+			return nil, err
 		}
 	}
 
@@ -252,33 +250,37 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) *Job {
 	defer conn.Close()
 
 	rawJSON, err := redis.Bytes(conn.Do("GET", uniqueKey))
+	if err == redis.ErrNil {
+		return nil, nil
+	}
 	if err != nil {
 		logError("worker.delete_unique_job.get", err)
-		return nil
+		return nil, err
+	}
+
+	// Keep the arguments for retry if DEL succeeds but its reply times out.
+	var jobWithArgs *Job
+	if string(rawJSON) != "1" {
+		jobWithArgs, err = newJob(rawJSON, job.dequeuedFrom, job.inProgQueue)
+		if err != nil {
+			logError("worker.delete_unique_job.updated_job", err)
+			return nil, err
+		}
+
+		// Completion must remove the exact payload moved into the in-progress list.
+		jobWithArgs.rawJSON = job.rawJSON
+		jobWithArgs.Fails = job.Fails
+		jobWithArgs.LastErr = job.LastErr
+		jobWithArgs.FailedAt = job.FailedAt
 	}
 
 	_, err = conn.Do("DEL", uniqueKey)
 	if err != nil {
 		logError("worker.delete_unique_job.del", err)
-		return nil
+		return jobWithArgs, err
 	}
 
-	// Previous versions did not support updated arguments and just set key to 1, so in these cases we should do nothing.
-	// In the future this can be deleted, as we will always be getting arguments from here
-	if string(rawJSON) == "1" {
-		return nil
-	}
-
-	// The job pulled off the queue was just a placeholder with no args, so replace it
-	jobWithArgs, err := newJob(rawJSON, job.dequeuedFrom, job.inProgQueue)
-	if err != nil {
-		logError("worker.delete_unique_job.updated_job", err)
-		return nil
-	}
-
-	// Completion must remove the exact payload moved into the in-progress list.
-	jobWithArgs.rawJSON = job.rawJSON
-	return jobWithArgs
+	return jobWithArgs, nil
 }
 
 func (w *worker) removeJobFromInProgress(job *Job, fate terminateOp) {
