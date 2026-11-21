@@ -203,11 +203,7 @@ func (w *worker) fetchJob() (*Job, error) {
 func (w *worker) processJob(job *Job) {
 	var runErr error
 	if job.Unique {
-		updatedJob, err := w.getAndDeleteUniqueJob(job)
-		runErr = err
-		if updatedJob != nil {
-			job = updatedJob
-		}
+		runErr = w.prepareUniqueJob(job)
 	}
 	jt := w.jobTypes[job.Name]
 	if jt == nil {
@@ -232,7 +228,7 @@ func (w *worker) processJob(job *Job) {
 	w.removeJobFromInProgress(job, fate)
 }
 
-func (w *worker) getAndDeleteUniqueJob(job *Job) (*Job, error) {
+func (w *worker) prepareUniqueJob(job *Job) error {
 	var uniqueKey string
 	var err error
 
@@ -242,7 +238,7 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) (*Job, error) {
 		uniqueKey, err = redisKeyUniqueJob(w.namespace, job.Name, job.Args)
 		if err != nil {
 			logError("worker.delete_unique_job.key", err)
-			return nil, err
+			return err
 		}
 	}
 
@@ -251,36 +247,30 @@ func (w *worker) getAndDeleteUniqueJob(job *Job) (*Job, error) {
 
 	rawJSON, err := redis.Bytes(conn.Do("GET", uniqueKey))
 	if err == redis.ErrNil {
-		return nil, nil
+		return nil
 	}
 	if err != nil {
 		logError("worker.delete_unique_job.get", err)
-		return nil, err
+		return err
 	}
 
 	// Keep the arguments for retry if DEL succeeds but its reply times out.
-	var jobWithArgs *Job
 	if string(rawJSON) != "1" {
-		jobWithArgs, err = newJob(rawJSON, job.dequeuedFrom, job.inProgQueue)
+		storedJob, err := newJob(rawJSON, nil, nil)
 		if err != nil {
 			logError("worker.delete_unique_job.updated_job", err)
-			return nil, err
+			return err
 		}
-
-		// Completion must remove the exact payload moved into the in-progress list.
-		jobWithArgs.rawJSON = job.rawJSON
-		jobWithArgs.Fails = job.Fails
-		jobWithArgs.LastErr = job.LastErr
-		jobWithArgs.FailedAt = job.FailedAt
+		job.Args = storedJob.Args
 	}
 
 	_, err = conn.Do("DEL", uniqueKey)
 	if err != nil {
 		logError("worker.delete_unique_job.del", err)
-		return jobWithArgs, err
+		return err
 	}
 
-	return jobWithArgs, nil
+	return nil
 }
 
 func (w *worker) removeJobFromInProgress(job *Job, fate terminateOp) {
