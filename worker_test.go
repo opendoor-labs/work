@@ -814,3 +814,114 @@ func TestWorkerScheduledUniqueByKeyRemovesDequeuedJob(t *testing.T) {
 	assert.EqualValues(t, 0, listSize(pool, redisKeyJobs(ns, name)))
 	assert.EqualValues(t, 0, getInt64(pool, redisKeyJobsLock(ns, name)))
 }
+
+func TestWorkerUniqueRedisErrorsRetryBeforeRunning(t *testing.T) {
+	for _, failure := range []struct {
+		name    string
+		command string
+		key     Q
+		applied bool
+	}{
+		{name: "lookup", command: "GET"},
+		{name: "delete", command: "DEL", key: Q{"key": "same"}},
+		{name: "delete_reply_lost", command: "DEL", key: Q{"key": "same"}, applied: true},
+	} {
+		t.Run(failure.name, func(t *testing.T) {
+			pool, server := newTestPoolWithServer(t)
+			t.Cleanup(func() { require.NoError(t, pool.Close()) })
+			ns, name := "work", "sync"
+			enqueuer := NewEnqueuer(ns, pool)
+			original, err := enqueuer.EnqueueUniqueByKey(name, Q{"value": "queued"}, failure.key)
+			require.NoError(t, err)
+			require.NotNil(t, original)
+			expectedValue := "queued"
+			if failure.key != nil {
+				stored := *original
+				stored.ID = "stored-job"
+				stored.Args = Q{"value": "updated"}
+				raw, err := stored.serialize()
+				require.NoError(t, err)
+				require.NoError(t, server.Set(original.UniqueKey, string(raw)))
+				expectedValue = "updated"
+			}
+
+			runs := 0
+			jobTypes := map[string]*jobType{name: {
+				Name: name, JobOptions: JobOptions{Priority: 1, MaxFails: 3}, IsGeneric: true,
+				GenericHandler: func(job *Job) error {
+					runs++
+					assert.Equal(t, original.ID, job.ID)
+					assert.Equal(t, expectedValue, job.Args["value"])
+					return nil
+				},
+			}}
+			w := newWorker(ns, "pool", pool, tstCtxType, nil, jobTypes, nil)
+			job, err := w.fetchJob()
+			require.NoError(t, err)
+			require.NotNil(t, job)
+
+			failures := 2
+			if failure.applied {
+				failures = 1
+			}
+			remaining := failures
+			timeout := fmt.Errorf("read timeout")
+			faultPool := &redis.Pool{Dial: func() (redis.Conn, error) {
+				return &uniqueCommandErrorConn{
+					Conn: pool.Get(), command: failure.command, key: original.UniqueKey,
+					remaining: &remaining, applied: failure.applied, err: timeout,
+				}, nil
+			}}
+			t.Cleanup(func() { require.NoError(t, faultPool.Close()) })
+			w.pool = faultPool
+			for attempt := 1; attempt <= failures; attempt++ {
+				w.processJob(job)
+				require.Zero(t, runs)
+				require.EqualValues(t, 1, zsetSize(pool, redisKeyRetry(ns)))
+				require.Zero(t, listSize(pool, redisKeyJobsInProgress(ns, w.poolID, name)))
+				_, retried := jobOnZset(pool, redisKeyRetry(ns))
+				require.EqualValues(t, attempt, retried.Fails)
+				require.Equal(t, timeout.Error(), retried.LastErr)
+
+				conn := pool.Get()
+				_, err = conn.Do("ZADD", redisKeyRetry(ns), nowEpochSeconds()-1, retried.rawJSON)
+				require.NoError(t, conn.Close())
+				require.NoError(t, err)
+				requeuer := newRequeuer(ns, pool, redisKeyRetry(ns), []string{name})
+				require.True(t, requeuer.process())
+				job, err = w.fetchJob()
+				require.NoError(t, err)
+				require.NotNil(t, job)
+			}
+
+			w.processJob(job)
+			require.Equal(t, 1, runs)
+			require.Zero(t, zsetSize(pool, redisKeyRetry(ns)))
+			next, err := enqueuer.EnqueueUniqueByKey(name, Q{"value": "queued"}, failure.key)
+			require.NoError(t, err)
+			require.NotNil(t, next)
+		})
+	}
+}
+
+type uniqueCommandErrorConn struct {
+	redis.Conn
+	command   string
+	key       string
+	remaining *int
+	applied   bool
+	err       error
+}
+
+func (c *uniqueCommandErrorConn) Do(command string, args ...interface{}) (interface{}, error) {
+	if command == c.command && len(args) == 1 && args[0] == c.key && *c.remaining > 0 {
+		*c.remaining--
+		if c.applied {
+			if _, err := c.Conn.Do(command, args...); err != nil {
+				return nil, err
+			}
+		}
+		return nil, c.err
+	}
+	return c.Conn.Do(command, args...)
+}
